@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 DB_NAME = "tracker.db"
 
 # ==================== TELEGRAM SOZLAMALARI ====================
-TELEGRAM_BOT_TOKEN = "8986494486:AAHJCM_fulQalFQLjArrnXWZ-kewpDGGavE"
+TELEGRAM_BOT_TOKEN = "8986494486:AAHJCm_fUlQalFQLjArrnXWZ-kewpDGGavE"
 TELEGRAM_CHAT_ID = "8130935215"
 
 def send_alert(message: str):
