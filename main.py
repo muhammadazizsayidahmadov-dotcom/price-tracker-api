@@ -29,30 +29,34 @@ def send_alert(message: str):
 # ==================== SKRAPER MOTOR ====================
 def scrape_product(url: str):
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-    resp = requests.get(url, headers=headers, timeout=10)
-    if resp.status_code != 200:
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            return None
+
+        soup = BeautifulSoup(resp.content, "html.parser")
+        title_elem = soup.find("h1") or soup.find("meta", property="og:title")
+        title = title_elem.text.strip() if title_elem else "Noma'lum tovar"
+
+        price = 0.0
+        price_elem = soup.find("p", class_="price_color") or soup.find("span", class_="price")
+        if price_elem:
+            import re
+            match = re.search(r"[\d\.]+", price_elem.text.replace(",", "."))
+            if match:
+                price = float(match.group())
+
+        avail_elem = soup.find("p", class_="instock availability")
+        is_available = True
+        if avail_elem and "In stock" not in avail_elem.text:
+            is_available = False
+
+        return {"title": title, "price": price, "availability": is_available}
+    except Exception as e:
+        print(f"Scraper xatosi: {e}")
         return None
-
-    soup = BeautifulSoup(resp.content, "html.parser")
-    title_elem = soup.find("h1") or soup.find("meta", property="og:title")
-    title = title_elem.text.strip() if title_elem else "Noma'lum tovar"
-
-    price = 0.0
-    price_elem = soup.find("p", class_="price_color") or soup.find("span", class_="price")
-    if price_elem:
-        import re
-        match = re.search(r"[\d\.]+", price_elem.text.replace(",", "."))
-        if match:
-            price = float(match.group())
-
-    avail_elem = soup.find("p", class_="instock availability")
-    is_available = True
-    if avail_elem and "In stock" not in avail_elem.text:
-        is_available = False
-
-    return {"title": title, "price": price, "availability": is_available}
 
 # ==================== BAZA INIT ====================
 def init_db():
@@ -74,7 +78,7 @@ def init_db():
 
 init_db()
 
-# ==================== CRON SCHEDULER ====================
+# ==================== CRON SCHEDULER & KEEP-ALIVE ====================
 def check_all_prices():
     print("🔄 [Scheduler] Narxlar fon tekshiruvi boshlandi...")
     conn = sqlite3.connect(DB_NAME)
@@ -111,10 +115,21 @@ def check_all_prices():
     conn.commit()
     conn.close()
 
+def keep_server_awake():
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        requests.get("https://price-tracker-api-d261.onrender.com/", headers=headers, timeout=10)
+        print("⏰ [Keep-Alive] Server o'zini uyg'otib turdi!")
+    except Exception as e:
+        print(f"Keep-alive xatosi: {e}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     scheduler = BackgroundScheduler()
+    # Narxlarni har 10 daqiqada tekshiradi
     scheduler.add_job(check_all_prices, 'interval', minutes=10)
+    # Server uxlab qolmasligi uchun har 8 daqiqada o'zini uyg'otadi
+    scheduler.add_job(keep_server_awake, 'interval', minutes=8)
     scheduler.start()
     send_alert("🚀 <b>PriceTracker Serveri muvaffaqiyatli ishga tushdi!</b>")
     yield
