@@ -134,6 +134,11 @@ class ProductRequest(BaseModel):
     url: str
 
 # ==================== ENDPOINTLAR ====================
+
+@app.get("/")
+def home():
+    return {"status": "online", "message": "PriceTracker API is running"}
+
 @app.get("/products")
 def get_products():
     conn = sqlite3.connect(DB_NAME)
