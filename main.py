@@ -1,76 +1,28 @@
+import os
 import sqlite3
-import requests
+import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from contextlib import asynccontextmanager
 
-DB_NAME = "tracker.db"
+# --- SOZLAMALAR ---
+# O'zingizning bot tokeningizni bu yerda tekshiring yoki Render Environment Variables orqali oling
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "BOT_TOKENINGIZNI_QO'YING")
 
-# ==================== TELEGRAM SOZLAMALARI ====================
-TELEGRAM_BOT_TOKEN = "8986494486:AAHJCm_fUlQalFQLjArrnXWZ-kewpDGGavE"
-TELEGRAM_CHAT_ID = "8130935215"
-
-def send_alert(message: str):
-    print(f"🔔 [XABAR]: {message}")
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        try:
-            tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            requests.post(tg_url, json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-                "parse_mode": "HTML"
-            }, timeout=8)
-        except Exception as e:
-            print(f"Telegram xatosi: {e}")
-
-# ==================== SKRAPER MOTOR ====================
-def scrape_product(url: str):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    try:
-        resp = requests.get(url, headers=headers, timeout=10)
-        if resp.status_code != 200:
-            return None
-
-        soup = BeautifulSoup(resp.content, "html.parser")
-        title_elem = soup.find("h1") or soup.find("meta", property="og:title")
-        title = title_elem.text.strip() if title_elem else "Noma'lum tovar"
-
-        price = 0.0
-        price_elem = soup.find("p", class_="price_color") or soup.find("span", class_="price")
-        if price_elem:
-            import re
-            match = re.search(r"[\d\.]+", price_elem.text.replace(",", "."))
-            if match:
-                price = float(match.group())
-
-        avail_elem = soup.find("p", class_="instock availability")
-        is_available = True
-        if avail_elem and "In stock" not in avail_elem.text:
-            is_available = False
-
-        return {"title": title, "price": price, "availability": is_available}
-    except Exception as e:
-        print(f"Scraper xatosi: {e}")
-        return None
-
-# ==================== BAZA INIT ====================
+# --- MA'LUMOTLAR BAZASI ---
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS products (
+    conn = sqlite3.connect("tracker.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL,
             title TEXT NOT NULL,
             current_price REAL NOT NULL,
-            original_price REAL NOT NULL,
-            is_available BOOLEAN NOT NULL,
-            url TEXT UNIQUE NOT NULL,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            chat_id TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     conn.commit()
@@ -78,121 +30,186 @@ def init_db():
 
 init_db()
 
-# ==================== CRON SCHEDULER & KEEP-ALIVE ====================
-def check_all_prices():
-    print("🔄 [Scheduler] Narxlar fon tekshiruvi boshlandi...")
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT id, title, current_price, original_price, url FROM products")
-    items = c.fetchall()
+# --- PYDANTIC MODEL ---
+class ItemCreate(BaseModel):
+    url: str
+    chat_id: str
 
-    for item_id, title, old_price, orig_price, url in items:
+# --- TELEGRAMGA XABAR YUBORISH (INGLIZCHA) ---
+async def send_telegram_alert(chat_id: str, message: str):
+    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "BOT_TOKENINGIZNI_QO'YING":
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "HTML"
+    }
+    async with httpx.AsyncClient() as client:
         try:
-            data = scrape_product(url)
-            if not data:
-                continue
-            new_price = data['price']
-            is_avail = data['availability']
-
-            if new_price < old_price:
-                msg = (
-                    f"🔥 <b>DIQQAT, NARX TUSHDI!</b>\n\n"
-                    f"📦 <b>{title}</b>\n"
-                    f"📉 Eski narx: <s>${old_price}</s>\n"
-                    f"🏷 Yangi narx: <b>${new_price}</b>\n"
-                    f"🔗 <a href='{url}'>Xarid qilish</a>"
-                )
-                send_alert(msg)
-
-            c.execute("""
-                UPDATE products 
-                SET current_price = ?, is_available = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            """, (new_price, is_avail, item_id))
+            await client.post(url, json=payload, timeout=10.0)
         except Exception as e:
-            print(f"Xatolik: {e}")
+            print(f"Telegram error: {e}")
 
-    conn.commit()
+# --- WEB SCRAPER FUNKSIYASI ---
+async def scrape_item(url: str):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+    }
+    async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=15.0) as client:
+        response = await client.get(url)
+        if response.status_code != 200:
+            raise HTTPException(status_code=400, detail="Failed to fetch page")
+            
+        soup = BeautifulSoup(response.text, "html.parser")
+        
+        # Sarlavhani topish
+        title_el = soup.find("h1") or soup.find("title")
+        title = title_el.get_text(strip=True)[:100] if title_el else "Unknown Product"
+        
+        # Narxni qidirish
+        price = 0.0
+        for selector in [".price", ".product-price", "[data-price]", "span"]:
+            el = soup.select_one(selector)
+            if el and any(char.isdigit() for char in el.text):
+                clean_num = ''.join([c for c in el.text if c.isdigit() or c in ['.', ',']])
+                try:
+                    price = float(clean_num.replace(',', '.'))
+                    break
+                except:
+                    continue
+        if price == 0.0:
+            price = 100.0  # Topilmaganda default test narx
+            
+        return title, price
+
+# --- NARXLARNI PERIODIK TEKSHIRIB TURISH (APScheduler) ---
+async def check_prices_job():
+    conn = sqlite3.connect("tracker.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, url, title, current_price, chat_id FROM items")
+    items = cursor.fetchall()
+    
+    for item in items:
+        item_id, url, title, old_price, chat_id = item
+        try:
+            _, new_price = await scrape_item(url)
+            if new_price < old_price:
+                # Narx arzonlashganda inglizcha xabar
+                msg = (
+                    f"🔥 <b>Price Drop Alert!</b>\n\n"
+                    f"📦 <b>Item:</b> {title}\n"
+                    f"📉 <b>Old Price:</b> {old_price} UZS\n"
+                    f"🎉 <b>New Price:</b> {new_price} UZS\n\n"
+                    f"👉 <a href='{url}'>View Deal</a>"
+                )
+                await send_telegram_alert(chat_id, msg)
+                cursor.execute("UPDATE items SET current_price = ? WHERE id = ?", (new_price, item_id))
+                conn.commit()
+        except Exception as e:
+            print(f"Error checking item {item_id}: {e}")
+            
     conn.close()
 
-def keep_server_awake():
-    try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        requests.get("https://price-tracker-api-d261.onrender.com/", headers=headers, timeout=10)
-        print("⏰ [Keep-Alive] Server o'zini uyg'otib turdi!")
-    except Exception as e:
-        print(f"Keep-alive xatosi: {e}")
-
+# --- FASTAPI LIFESPAN VA APP ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    scheduler = BackgroundScheduler()
-    # Narxlarni har 10 daqiqada tekshiradi
-    scheduler.add_job(check_all_prices, 'interval', minutes=10)
-    # Server uxlab qolmasligi uchun har 8 daqiqada o'zini uyg'otadi
-    scheduler.add_job(keep_server_awake, 'interval', minutes=8)
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(check_prices_job, "interval", minutes=60)
     scheduler.start()
-    send_alert("🚀 <b>PriceTracker Serveri muvaffaqiyatli ishga tushdi!</b>")
     yield
     scheduler.shutdown()
 
-app = FastAPI(title="PriceTracker PRO API", lifespan=lifespan)
+app = FastAPI(title="Price Tracker API", lifespan=lifespan)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class ProductRequest(BaseModel):
-    url: str
-
-# ==================== ENDPOINTLAR ====================
+# --- ENDPOINTLAR ---
 
 @app.get("/")
-def home():
-    return {"status": "online", "message": "PriceTracker API is running"}
+def read_root():
+    return {"status": "ok", "service": "Price Tracker API"}
 
-@app.get("/products")
-def get_products():
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("SELECT id, title, current_price, original_price, is_available, url FROM products ORDER BY id DESC")
-    rows = c.fetchall()
+@app.get("/items")
+def get_items(chat_id: str):
+    conn = sqlite3.connect("tracker.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, url, title, current_price, chat_id, created_at FROM items WHERE chat_id = ?", (chat_id,))
+    rows = cursor.fetchall()
     conn.close()
-    return {"status": "success", "data": [
-        {"id": r[0], "title": r[1], "current_price": r[2], "original_price": r[3], "is_available": bool(r[4]), "url": r[5]}
+    
+    return [
+        {
+            "id": r[0],
+            "url": r[1],
+            "title": r[2],
+            "current_price": r[3],
+            "chat_id": r[4],
+            "created_at": r[5]
+        }
         for r in rows
-    ]}
+    ]
 
-@app.post("/products")
-def add_product(payload: ProductRequest):
-    data = scrape_product(payload.url)
-    if not data or not data.get("title"):
-        raise HTTPException(status_code=400, detail="Tovarni skanerlab bo'lmadi")
-
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    try:
-        c.execute("""
-            INSERT INTO products (title, current_price, original_price, is_available, url)
-            VALUES (?, ?, ?, ?, ?)
-        """, (data["title"], data["price"], data["price"], data["availability"], payload.url))
-        conn.commit()
-        prod_id = c.lastrowid
-        send_alert(f"✅ <b>Yangi tovar kuzatuvga olindi:</b>\n📦 {data['title']}\n💵 Narxi: ${data['price']}")
-    except sqlite3.IntegrityError:
+@app.post("/items")
+async def create_item(payload: ItemCreate):
+    conn = sqlite3.connect("tracker.db")
+    cursor = conn.cursor()
+    
+    # Freemium chegarasi: 3 ta tovar
+    cursor.execute("SELECT COUNT(*) FROM items WHERE chat_id = ?", (payload.chat_id,))
+    count = cursor.fetchone()[0]
+    if count >= 3:
         conn.close()
-        raise HTTPException(status_code=400, detail="Bu tovar allaqachon qo'shilgan")
+        raise HTTPException(
+            status_code=403, 
+            detail="Free tier limit reached (3 items maximum). Upgrade to PRO!"
+        )
+    
+    # Narx va sarlavhani olish
+    title, price = await scrape_item(payload.url)
+    
+    cursor.execute(
+        "INSERT INTO items (url, title, current_price, chat_id) VALUES (?, ?, ?, ?)",
+        (payload.url, title, price, payload.chat_id)
+    )
+    conn.commit()
+    new_id = cursor.lastrowid
     conn.close()
-    return {"status": "success", "id": prod_id, "data": data}
+    
+    # Yangi tovar qo'shilganda yuboriladigan inglizcha xabar
+    msg = (
+        f"✅ <b>Tracking Started!</b>\n\n"
+        f"📦 <b>Item:</b> {title}\n"
+        f"💰 <b>Initial Price:</b> {price} UZS\n\n"
+        f"<i>We will notify you immediately if the price drops!</i>"
+    )
+    await send_telegram_alert(payload.chat_id, msg)
+    
+    return {"id": new_id, "title": title, "current_price": price, "status": "tracking"}
 
-@app.delete("/products/{product_id}")
-def delete_product(product_id: int):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    cursor = c.execute("DELETE FROM products WHERE id = ?", (product_id,))
+@app.delete("/items/{item_id}")
+async def delete_item(item_id: int):
+    conn = sqlite3.connect("tracker.db")
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT title, chat_id FROM items WHERE id = ?", (item_id,))
+    item = cursor.fetchone()
+    
+    if not item:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Item not found")
+        
+    title, chat_id = item
+    
+    cursor.execute("DELETE FROM items WHERE id = ?", (item_id,))
     conn.commit()
     conn.close()
-    return {"status": "success", "message": "O'chirildi"}
+    
+    # Tovar o'chirilganda yuboriladigan inglizcha xabar
+    if chat_id:
+        msg = (
+            f"🗑 <b>Removed from Tracking:</b>\n\n"
+            f"📌 <b>Item:</b> {title}\n\n"
+            f"<i>This item is no longer being monitored.</i>"
+        )
+        await send_telegram_alert(chat_id, msg)
+        
+    return {"message": "Item deleted successfully"}
