@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 
 # --- SOZLAMALAR ---
 # O'zingizning bot tokeningizni bu yerda tekshiring yoki Render Environment Variables orqali oling
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "BOT_TOKENINGIZNI_QO'YING")
+TELEGRAM_BOT_TOKEN = os.getenv("8986494486:AAHJCm_fUlQalFQLjArrnXWZ-kewpDGGavE")
 
 # --- MA'LUMOTLAR BAZASI ---
 def init_db():
