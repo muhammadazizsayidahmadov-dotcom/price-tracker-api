@@ -8,7 +8,7 @@ from pydantic import BaseModel
 
 app = FastAPI(title="Price & Stock Tracker API")
 
-# Mobil ilovadan CORS orqali keladigan so'rovlarga to'liq ruxsat berish
+# Mobil ilovadan keluvchi so'rovlar uchun CORS ruxsati
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,11 +17,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Telegram sozlamalari
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8986494486:AAHJCm_fUlQalFQLjArrnXWZ-kewpDGGavE")
 DB_NAME = "tracker.db"
 
-# Ma'lumotlar bazasini initsializatsiya qilish
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
@@ -40,7 +38,6 @@ def init_db():
 
 init_db()
 
-# Pydantic modellari
 class ItemCreate(BaseModel):
     url: str
     chat_id: str
@@ -53,7 +50,6 @@ class ItemResponse(BaseModel):
     in_stock: bool
     chat_id: str
 
-# Telegramga xabar yuborish funksiyasi
 def send_telegram_alert(chat_id: str, message: str):
     if not chat_id:
         return
@@ -75,7 +71,6 @@ def send_telegram_alert(chat_id: str, message: str):
 def read_root():
     return {"status": "ok", "service": "Price Tracker API"}
 
-# Foydalanuvchi tovarlarini olish
 @app.get("/items", response_model=List[ItemResponse])
 def get_items(chat_id: Optional[str] = Query(None)):
     conn = sqlite3.connect(DB_NAME)
@@ -100,13 +95,11 @@ def get_items(chat_id: Optional[str] = Query(None)):
         })
     return items
 
-# Yangi tovar qo'shish va Telegramga bildirishnoma jo'natish
 @app.post("/items", response_model=ItemResponse)
 def add_item(item: ItemCreate):
     cleaned_chat_id = str(item.chat_id).strip()
     clean_url = item.url.strip()
 
-    # Sayt nomidan avtomatik taxminiy sarlavha shakllantirish
     extracted_title = "Online Store Product"
     try:
         domain_part = clean_url.split("//")[-1].split("/")[0].replace("www.", "")
@@ -114,7 +107,7 @@ def add_item(item: ItemCreate):
     except Exception:
         pass
 
-    default_price = 150000.0
+    default_price = 29.99
     in_stock_val = 1
 
     conn = sqlite3.connect(DB_NAME)
@@ -127,11 +120,11 @@ def add_item(item: ItemCreate):
     conn.commit()
     conn.close()
 
-    # Telegram bot orqali inglizcha alert yuborish
+    # Telegram bot orqali xalqaro formatdagi ($) inglizcha bildirishnoma yuborish
     alert_text = (
         f"🔔 *New Product Tracked!*\n\n"
         f"📦 *Item:* `{extracted_title}`\n"
-        f"💰 *Current Price:* {default_price:,.0f} UZS\n"
+        f"💰 *Current Price:* ${default_price:.2f}\n"
         f"✅ *Stock Status:* In Stock\n"
         f"🔗 [Open Product Page]({clean_url})"
     )
@@ -146,7 +139,6 @@ def add_item(item: ItemCreate):
         "chat_id": cleaned_chat_id
     }
 
-# Tovarni o'chirish va Telegramga bildirishnoma jo'natish
 @app.delete("/items/{item_id}")
 def delete_item(item_id: int):
     conn = sqlite3.connect(DB_NAME)
@@ -165,7 +157,6 @@ def delete_item(item_id: int):
     conn.commit()
     conn.close()
 
-    # O'chirilganligi haqida botga xabar yuborish
     alert_text = f"🗑 *Item Untracked*\n\n`{item_title}` has been successfully removed from your tracking list."
     send_telegram_alert(chat_id, alert_text)
 
