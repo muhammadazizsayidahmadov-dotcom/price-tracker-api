@@ -7,11 +7,8 @@ from pydantic import BaseModel
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from contextlib import asynccontextmanager
 
-# --- SOZLAMALAR ---
-# O'zingizning bot tokeningizni bu yerda tekshiring yoki Render Environment Variables orqali oling
 TELEGRAM_BOT_TOKEN = "8986494486:AAHJcm_fU1Qa1FQLjArrnXWZ-kewpDGGavE"
 
-# --- MA'LUMOTLAR BAZASI ---
 def init_db():
     conn = sqlite3.connect("tracker.db")
     cursor = conn.cursor()
@@ -30,14 +27,12 @@ def init_db():
 
 init_db()
 
-# --- PYDANTIC MODEL ---
 class ItemCreate(BaseModel):
     url: str
     chat_id: str
 
-# --- TELEGRAMGA XABAR YUBORISH (INGLIZCHA) ---
 async def send_telegram_alert(chat_id: str, message: str):
-    if not TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN == "BOT_TOKENINGIZNI_QO'YING":
+    if not TELEGRAM_BOT_TOKEN:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -51,7 +46,6 @@ async def send_telegram_alert(chat_id: str, message: str):
         except Exception as e:
             print(f"Telegram error: {e}")
 
-# --- WEB SCRAPER FUNKSIYASI ---
 async def scrape_item(url: str):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
@@ -63,11 +57,9 @@ async def scrape_item(url: str):
             
         soup = BeautifulSoup(response.text, "html.parser")
         
-        # Sarlavhani topish
         title_el = soup.find("h1") or soup.find("title")
         title = title_el.get_text(strip=True)[:100] if title_el else "Unknown Product"
         
-        # Narxni qidirish
         price = 0.0
         for selector in [".price", ".product-price", "[data-price]", "span"]:
             el = soup.select_one(selector)
@@ -79,11 +71,10 @@ async def scrape_item(url: str):
                 except:
                     continue
         if price == 0.0:
-            price = 100.0  # Topilmaganda default test narx
+            price = 100.0
             
         return title, price
 
-# --- NARXLARNI PERIODIK TEKSHIRIB TURISH (APScheduler) ---
 async def check_prices_job():
     conn = sqlite3.connect("tracker.db")
     cursor = conn.cursor()
@@ -95,7 +86,6 @@ async def check_prices_job():
         try:
             _, new_price = await scrape_item(url)
             if new_price < old_price:
-                # Narx arzonlashganda inglizcha xabar
                 msg = (
                     f"🔥 <b>Price Drop Alert!</b>\n\n"
                     f"📦 <b>Item:</b> {title}\n"
@@ -111,7 +101,6 @@ async def check_prices_job():
             
     conn.close()
 
-# --- FASTAPI LIFESPAN VA APP ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     scheduler = AsyncIOScheduler()
@@ -121,8 +110,6 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown()
 
 app = FastAPI(title="Price Tracker API", lifespan=lifespan)
-
-# --- ENDPOINTLAR ---
 
 @app.get("/")
 def read_root():
@@ -153,7 +140,6 @@ async def create_item(payload: ItemCreate):
     conn = sqlite3.connect("tracker.db")
     cursor = conn.cursor()
     
-    # Freemium chegarasi: 3 ta tovar
     cursor.execute("SELECT COUNT(*) FROM items WHERE chat_id = ?", (payload.chat_id,))
     count = cursor.fetchone()[0]
     if count >= 3:
@@ -163,7 +149,6 @@ async def create_item(payload: ItemCreate):
             detail="Free tier limit reached (3 items maximum). Upgrade to PRO!"
         )
     
-    # Narx va sarlavhani olish
     title, price = await scrape_item(payload.url)
     
     cursor.execute(
@@ -174,7 +159,6 @@ async def create_item(payload: ItemCreate):
     new_id = cursor.lastrowid
     conn.close()
     
-    # Yangi tovar qo'shilganda yuboriladigan inglizcha xabar
     msg = (
         f"✅ <b>Tracking Started!</b>\n\n"
         f"📦 <b>Item:</b> {title}\n"
@@ -203,7 +187,6 @@ async def delete_item(item_id: int):
     conn.commit()
     conn.close()
     
-    # Tovar o'chirilganda yuboriladigan inglizcha xabar
     if chat_id:
         msg = (
             f"🗑 <b>Removed from Tracking:</b>\n\n"
