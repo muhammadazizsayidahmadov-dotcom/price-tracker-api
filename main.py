@@ -1,14 +1,16 @@
 import os
+import re
 import sqlite3
 import requests
+from bs4 import BeautifulSoup
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from apscheduler.schedulers.background import BackgroundScheduler
 
-app = FastAPI(title="Price & Stock Tracker API")
+app = FastAPI(title="PriceTracker PRO API")
 
-# Mobil ilovadan keluvchi so'rovlar uchun CORS ruxsati
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -62,14 +64,88 @@ def send_telegram_alert(chat_id: str, message: str):
         "disable_web_page_preview": False
     }
     try:
-        response = requests.post(url, json=payload, timeout=10)
-        print(f"Telegram status: {response.status_code}, response: {response.text}")
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
-        print(f"Error sending Telegram notification: {e}")
+        print(f"Telegram error: {e}")
+
+def scrape_product_details(url: str):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9"
+    }
+    extracted_title = "Online Store Product"
+    extracted_price = 29.99
+
+    try:
+        domain = url.split("//")[-1].split("/")[0].replace("www.", "")
+        extracted_title = f"Product from {domain}"
+    except Exception:
+        pass
+
+    try:
+        response = requests.get(url, headers=headers, timeout=8)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, "html.parser")
+            
+            # Sarlavhani aniqlash
+            h1_tag = soup.find("h1")
+            meta_title = soup.find("meta", property="og:title")
+            if h1_tag and h1_tag.get_text(strip=True):
+                extracted_title = h1_tag.get_text(strip=True)[:70]
+            elif meta_title and meta_title.get("content"):
+                extracted_title = meta_title.get("content")[:70]
+
+            # Narxni matn orasidan qidirish
+            meta_price = soup.find("meta", property="product:price:amount")
+            if meta_price and meta_price.get("content"):
+                try:
+                    extracted_price = float(meta_price.get("content"))
+                except ValueError:
+                    pass
+            else:
+                price_candidates = soup.find_all(text=re.compile(r'\$\s*\d+[\d,.]*|\d+[\d,.]*\s*(?:USD|UZS|\$)'))
+                for p in price_candidates:
+                    digits = re.findall(r'\d+(?:\.\d+)?', p.replace(',', ''))
+                    if digits:
+                        val = float(digits[0])
+                        if 1.0 <= val <= 10000.0:
+                            extracted_price = val
+                            break
+    except Exception as e:
+        print(f"Scraping notice: {e}")
+
+    return extracted_title, extracted_price
+
+# Har soatda avtomatik narx o'zgarishini tekshirish
+def auto_check_prices():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, url, title, current_price, chat_id FROM items")
+    rows = cursor.fetchall()
+
+    for item_id, item_url, old_title, old_price, chat_id in rows:
+        _, new_price = scrape_product_details(item_url)
+        if new_price and new_price < old_price:
+            cursor.execute("UPDATE items SET current_price = ? WHERE id = ?", (new_price, item_id))
+            conn.commit()
+
+            alert_msg = (
+                f"🔥 *PRICE DROP ALERT!*\n\n"
+                f"📦 *Item:* `{old_title}`\n"
+                f"📉 *Old Price:* ${old_price:.2f}\n"
+                f"🎉 *New Price:* ${new_price:.2f}\n"
+                f"🔗 [Buy Now]({item_url})"
+            )
+            send_telegram_alert(chat_id, alert_msg)
+    conn.close()
+
+scheduler = BackgroundScheduler()
+scheduler.add_job(auto_check_prices, 'interval', hours=1)
+scheduler.start()
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "service": "Price Tracker API"}
+    return {"status": "ok", "service": "PriceTracker PRO API"}
 
 @app.get("/items", response_model=List[ItemResponse])
 def get_items(chat_id: Optional[str] = Query(None)):
@@ -83,48 +159,40 @@ def get_items(chat_id: Optional[str] = Query(None)):
     rows = cursor.fetchall()
     conn.close()
 
-    items = []
-    for row in rows:
-        items.append({
-            "id": row[0],
-            "url": row[1],
-            "title": row[2],
-            "current_price": float(row[3]),
-            "in_stock": bool(row[4]),
-            "chat_id": row[5]
-        })
-    return items
+    return [
+        {
+            "id": r[0],
+            "url": r[1],
+            "title": r[2],
+            "current_price": float(r[3]),
+            "in_stock": bool(r[4]),
+            "chat_id": r[5]
+        }
+        for r in rows
+    ]
 
 @app.post("/items", response_model=ItemResponse)
 def add_item(item: ItemCreate):
     cleaned_chat_id = str(item.chat_id).strip()
     clean_url = item.url.strip()
 
-    extracted_title = "Online Store Product"
-    try:
-        domain_part = clean_url.split("//")[-1].split("/")[0].replace("www.", "")
-        extracted_title = f"Product from {domain_part}"
-    except Exception:
-        pass
-
-    default_price = 29.99
+    title, price = scrape_product_details(clean_url)
     in_stock_val = 1
 
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO items (url, title, current_price, in_stock, chat_id) VALUES (?, ?, ?, ?, ?)",
-        (clean_url, extracted_title, default_price, in_stock_val, cleaned_chat_id)
+        (clean_url, title, price, in_stock_val, cleaned_chat_id)
     )
     new_id = cursor.lastrowid
     conn.commit()
     conn.close()
 
-    # Telegram bot orqali xalqaro formatdagi ($) inglizcha bildirishnoma yuborish
     alert_text = (
         f"🔔 *New Product Tracked!*\n\n"
-        f"📦 *Item:* `{extracted_title}`\n"
-        f"💰 *Current Price:* ${default_price:.2f}\n"
+        f"📦 *Item:* `{title}`\n"
+        f"💰 *Current Price:* ${price:.2f}\n"
         f"✅ *Stock Status:* In Stock\n"
         f"🔗 [Open Product Page]({clean_url})"
     )
@@ -133,8 +201,8 @@ def add_item(item: ItemCreate):
     return {
         "id": new_id,
         "url": clean_url,
-        "title": extracted_title,
-        "current_price": default_price,
+        "title": title,
+        "current_price": price,
         "in_stock": True,
         "chat_id": cleaned_chat_id
     }
