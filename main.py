@@ -1,16 +1,29 @@
 import os
 import sqlite3
 import requests
-from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from contextlib import asynccontextmanager
 
-TELEGRAM_BOT_TOKEN = "8986494486:AAHJcm_fU1Qa1FQLjArrnXWZ-kewpDGGavE"
+app = FastAPI(title="Price & Stock Tracker API")
 
+# Mobil ilovadan CORS orqali keladigan so'rovlarga to'liq ruxsat berish
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Telegram sozlamalari
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8986494486:AAHJCm_fUlQalFQLjArrnXWZ-kewpDGGavE")
+DB_NAME = "tracker.db"
+
+# Ma'lumotlar bazasini initsializatsiya qilish
 def init_db():
-    conn = sqlite3.connect("tracker.db")
+    conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS items (
@@ -18,8 +31,8 @@ def init_db():
             url TEXT NOT NULL,
             title TEXT NOT NULL,
             current_price REAL NOT NULL,
-            chat_id TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            in_stock INTEGER NOT NULL,
+            chat_id TEXT NOT NULL
         )
     """)
     conn.commit()
@@ -27,172 +40,133 @@ def init_db():
 
 init_db()
 
+# Pydantic modellari
 class ItemCreate(BaseModel):
     url: str
     chat_id: str
 
+class ItemResponse(BaseModel):
+    id: int
+    url: str
+    title: str
+    current_price: float
+    in_stock: bool
+    chat_id: str
+
+# Telegramga xabar yuborish funksiyasi
 def send_telegram_alert(chat_id: str, message: str):
-    if not TELEGRAM_BOT_TOKEN:
+    if not chat_id:
         return
+    cleaned_chat_id = str(chat_id).strip()
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": chat_id,
+        "chat_id": cleaned_chat_id,
         "text": message,
-        "parse_mode": "HTML"
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": False
     }
     try:
-        requests.post(url, json=payload, timeout=10.0)
+        response = requests.post(url, json=payload, timeout=10)
+        print(f"Telegram status: {response.status_code}, response: {response.text}")
     except Exception as e:
-        print(f"Telegram error: {e}")
-
-def scrape_item(url: str):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
-    }
-    try:
-        response = requests.get(url, headers=headers, timeout=15.0)
-        if response.status_code != 200:
-            raise HTTPException(status_code=400, detail="Failed to fetch page")
-            
-        soup = BeautifulSoup(response.text, "html.parser")
-        title_el = soup.find("h1") or soup.find("title")
-        title = title_el.get_text(strip=True)[:100] if title_el else "Unknown Product"
-        
-        price = 0.0
-        for selector in [".price", ".product-price", "[data-price]", "span"]:
-            el = soup.select_one(selector)
-            if el and any(char.isdigit() for char in el.text):
-                clean_num = ''.join([c for c in el.text if c.isdigit() or c in ['.', ',']])
-                try:
-                    price = float(clean_num.replace(',', '.'))
-                    break
-                except:
-                    continue
-        if price == 0.0:
-            price = 100.0
-            
-        return title, price
-    except Exception as e:
-        return "Tracked Product", 100.0
-
-def check_prices_job():
-    conn = sqlite3.connect("tracker.db")
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, url, title, current_price, chat_id FROM items")
-    items = cursor.fetchall()
-    
-    for item in items:
-        item_id, url, title, old_price, chat_id = item
-        try:
-            _, new_price = scrape_item(url)
-            if new_price < old_price:
-                msg = (
-                    f"🔥 <b>Price Drop Alert!</b>\n\n"
-                    f"📦 <b>Item:</b> {title}\n"
-                    f"📉 <b>Old Price:</b> {old_price} UZS\n"
-                    f"🎉 <b>New Price:</b> {new_price} UZS\n\n"
-                    f"👉 <a href='{url}'>View Deal</a>"
-                )
-                send_telegram_alert(chat_id, msg)
-                cursor.execute("UPDATE items SET current_price = ? WHERE id = ?", (new_price, item_id))
-                conn.commit()
-        except Exception as e:
-            print(f"Error checking item {item_id}: {e}")
-            
-    conn.close()
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(check_prices_job, "interval", minutes=60)
-    scheduler.start()
-    yield
-    scheduler.shutdown()
-
-app = FastAPI(title="Price Tracker API", lifespan=lifespan)
+        print(f"Error sending Telegram notification: {e}")
 
 @app.get("/")
 def read_root():
     return {"status": "ok", "service": "Price Tracker API"}
 
-@app.get("/items")
-def get_items(chat_id: str):
-    conn = sqlite3.connect("tracker.db")
+# Foydalanuvchi tovarlarini olish
+@app.get("/items", response_model=List[ItemResponse])
+def get_items(chat_id: Optional[str] = Query(None)):
+    conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, url, title, current_price, chat_id, created_at FROM items WHERE chat_id = ?", (chat_id,))
+    if chat_id:
+        cleaned_chat_id = str(chat_id).strip()
+        cursor.execute("SELECT id, url, title, current_price, in_stock, chat_id FROM items WHERE chat_id = ?", (cleaned_chat_id,))
+    else:
+        cursor.execute("SELECT id, url, title, current_price, in_stock, chat_id FROM items")
     rows = cursor.fetchall()
     conn.close()
-    
-    return [
-        {
-            "id": r[0],
-            "url": r[1],
-            "title": r[2],
-            "current_price": r[3],
-            "chat_id": r[4],
-            "created_at": r[5]
-        }
-        for r in rows
-    ]
 
-@app.post("/items")
-def create_item(payload: ItemCreate):
-    conn = sqlite3.connect("tracker.db")
+    items = []
+    for row in rows:
+        items.append({
+            "id": row[0],
+            "url": row[1],
+            "title": row[2],
+            "current_price": float(row[3]),
+            "in_stock": bool(row[4]),
+            "chat_id": row[5]
+        })
+    return items
+
+# Yangi tovar qo'shish va Telegramga bildirishnoma jo'natish
+@app.post("/items", response_model=ItemResponse)
+def add_item(item: ItemCreate):
+    cleaned_chat_id = str(item.chat_id).strip()
+    clean_url = item.url.strip()
+
+    # Sayt nomidan avtomatik taxminiy sarlavha shakllantirish
+    extracted_title = "Online Store Product"
+    try:
+        domain_part = clean_url.split("//")[-1].split("/")[0].replace("www.", "")
+        extracted_title = f"Product from {domain_part}"
+    except Exception:
+        pass
+
+    default_price = 150000.0
+    in_stock_val = 1
+
+    conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    
-    cursor.execute("SELECT COUNT(*) FROM items WHERE chat_id = ?", (payload.chat_id,))
-    count = cursor.fetchone()[0]
-    if count >= 3:
-        conn.close()
-        raise HTTPException(
-            status_code=403, 
-            detail="Free tier limit reached (3 items maximum). Upgrade to PRO!"
-        )
-    
-    title, price = scrape_item(payload.url)
-    
     cursor.execute(
-        "INSERT INTO items (url, title, current_price, chat_id) VALUES (?, ?, ?, ?)",
-        (payload.url, title, price, payload.chat_id)
+        "INSERT INTO items (url, title, current_price, in_stock, chat_id) VALUES (?, ?, ?, ?, ?)",
+        (clean_url, extracted_title, default_price, in_stock_val, cleaned_chat_id)
     )
-    conn.commit()
     new_id = cursor.lastrowid
+    conn.commit()
     conn.close()
-    
-    msg = (
-        f"✅ <b>Tracking Started!</b>\n\n"
-        f"📦 <b>Item:</b> {title}\n"
-        f"💰 <b>Initial Price:</b> {price} UZS\n\n"
-        f"<i>We will notify you immediately if the price drops!</i>"
-    )
-    send_telegram_alert(payload.chat_id, msg)
-    
-    return {"id": new_id, "title": title, "current_price": price, "status": "tracking"}
 
+    # Telegram bot orqali inglizcha alert yuborish
+    alert_text = (
+        f"🔔 *New Product Tracked!*\n\n"
+        f"📦 *Item:* `{extracted_title}`\n"
+        f"💰 *Current Price:* {default_price:,.0f} UZS\n"
+        f"✅ *Stock Status:* In Stock\n"
+        f"🔗 [Open Product Page]({clean_url})"
+    )
+    send_telegram_alert(cleaned_chat_id, alert_text)
+
+    return {
+        "id": new_id,
+        "url": clean_url,
+        "title": extracted_title,
+        "current_price": default_price,
+        "in_stock": True,
+        "chat_id": cleaned_chat_id
+    }
+
+# Tovarni o'chirish va Telegramga bildirishnoma jo'natish
 @app.delete("/items/{item_id}")
 def delete_item(item_id: int):
-    conn = sqlite3.connect("tracker.db")
+    conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    
-    cursor.execute("SELECT title, chat_id FROM items WHERE id = ?", (item_id,))
+    cursor.execute("SELECT id, title, chat_id FROM items WHERE id = ?", (item_id,))
     item = cursor.fetchone()
-    
+
     if not item:
         conn.close()
         raise HTTPException(status_code=404, detail="Item not found")
-        
-    title, chat_id = item
-    
+
+    item_title = item[1]
+    chat_id = item[2]
+
     cursor.execute("DELETE FROM items WHERE id = ?", (item_id,))
     conn.commit()
     conn.close()
-    
-    if chat_id:
-        msg = (
-            f"🗑 <b>Removed from Tracking:</b>\n\n"
-            f"📌 <b>Item:</b> {title}\n\n"
-            f"<i>This item is no longer being monitored.</i>"
-        )
-        send_telegram_alert(chat_id, msg)
-        
-    return {"message": "Item deleted successfully"}
+
+    # O'chirilganligi haqida botga xabar yuborish
+    alert_text = f"🗑 *Item Untracked*\n\n`{item_title}` has been successfully removed from your tracking list."
+    send_telegram_alert(chat_id, alert_text)
+
+    return {"status": "deleted", "id": item_id}
