@@ -4,7 +4,7 @@ import sqlite3
 import requests
 from bs4 import BeautifulSoup
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -112,7 +112,6 @@ def scrape_product_details(url: str):
                 if match:
                     extracted_price = float(match.group(1).replace(",", "."))
             else:
-                # Butun HTML matnidan valyutali narxni qidirish
                 match = re.search(r"[\$£€]\s*(\d+[\.,]\d{1,2})", response.text)
                 if match:
                     extracted_price = float(match.group(1).replace(",", "."))
@@ -215,7 +214,7 @@ def add_item(item: ItemCreate):
         "chat_id": cleaned_chat_id
     }
 
-# Tovarni o'chirish va Telegramga bildirishnoma jo'natish
+# Tovarni o'chirish
 @app.delete("/items/{item_id}")
 def delete_item(item_id: int):
     conn = sqlite3.connect(DB_NAME)
@@ -237,9 +236,9 @@ def delete_item(item_id: int):
     alert_text = f"🗑 *Item Untracked*\n\n`{item_title}` has been successfully removed from your tracking list."
     send_telegram_alert(chat_id, alert_text)
 
-    return {"status": "deleted", "id": item_id} 
-from fastapi import Request
+    return {"status": "deleted", "id": item_id}
 
+# LemonSqueezy Webhook qabul qiluvchi yagona endpoint
 @app.post("/webhook/lemonsqueezy")
 async def lemonsqueezy_webhook(request: Request):
     try:
@@ -254,38 +253,6 @@ async def lemonsqueezy_webhook(request: Request):
         if event_name in ["order_created", "subscription_created"]:
             print(f"Yangi obuna/xarid: {user_email} - {total_formatted}")
             
-            # Agar bot orqali bildirishnoma yuborilishi kerak bo'lsa
-            custom_data = payload.get("meta", {}).get("custom_data", {})
-            chat_id = custom_data.get("chat_id")
-            if chat_id:
-                pro_alert = (
-                    f"🎉 *TABRIKLAYMIZ!*\n\n"
-                    f"Siz muvaffaqiyatli *PriceTracker PRO* obunachisi bo‘ldingiz!\n"
-                    f"💰 To‘lov: `{total_formatted}`\n"
-                    f"⚡ Endi cheksiz tovarlarni kuzatishingiz mumkin!"
-                )
-                send_telegram_alert(chat_id, pro_alert)
-
-        return {"status": "success"}
-    except Exception as e:
-        print(f"Webhook xatosi: {e}")
-        return {"status": "error", "message": str(e)}from fastapi import Request
-
-@app.post("/webhook/lemonsqueezy")
-async def lemonsqueezy_webhook(request: Request):
-    try:
-        payload = await request.json()
-        event_name = payload.get("meta", {}).get("event_name")
-        data = payload.get("data", {})
-        attributes = data.get("attributes", {})
-        
-        user_email = attributes.get("user_email")
-        total_formatted = attributes.get("total_formatted", "$4.99")
-
-        if event_name in ["order_created", "subscription_created"]:
-            print(f"Yangi obuna/xarid: {user_email} - {total_formatted}")
-            
-            # Agar bot orqali bildirishnoma yuborilishi kerak bo'lsa
             custom_data = payload.get("meta", {}).get("custom_data", {})
             chat_id = custom_data.get("chat_id")
             if chat_id:
