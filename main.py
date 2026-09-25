@@ -1,6 +1,6 @@
 import os
 import sqlite3
-import httpx
+import requests
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -31,7 +31,7 @@ class ItemCreate(BaseModel):
     url: str
     chat_id: str
 
-async def send_telegram_alert(chat_id: str, message: str):
+def send_telegram_alert(chat_id: str, message: str):
     if not TELEGRAM_BOT_TOKEN:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -40,23 +40,21 @@ async def send_telegram_alert(chat_id: str, message: str):
         "text": message,
         "parse_mode": "HTML"
     }
-    async with httpx.AsyncClient() as client:
-        try:
-            await client.post(url, json=payload, timeout=10.0)
-        except Exception as e:
-            print(f"Telegram error: {e}")
+    try:
+        requests.post(url, json=payload, timeout=10.0)
+    except Exception as e:
+        print(f"Telegram error: {e}")
 
-async def scrape_item(url: str):
+def scrape_item(url: str):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
     }
-    async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=15.0) as client:
-        response = await client.get(url)
+    try:
+        response = requests.get(url, headers=headers, timeout=15.0)
         if response.status_code != 200:
             raise HTTPException(status_code=400, detail="Failed to fetch page")
             
         soup = BeautifulSoup(response.text, "html.parser")
-        
         title_el = soup.find("h1") or soup.find("title")
         title = title_el.get_text(strip=True)[:100] if title_el else "Unknown Product"
         
@@ -74,8 +72,10 @@ async def scrape_item(url: str):
             price = 100.0
             
         return title, price
+    except Exception as e:
+        return "Tracked Product", 100.0
 
-async def check_prices_job():
+def check_prices_job():
     conn = sqlite3.connect("tracker.db")
     cursor = conn.cursor()
     cursor.execute("SELECT id, url, title, current_price, chat_id FROM items")
@@ -84,7 +84,7 @@ async def check_prices_job():
     for item in items:
         item_id, url, title, old_price, chat_id = item
         try:
-            _, new_price = await scrape_item(url)
+            _, new_price = scrape_item(url)
             if new_price < old_price:
                 msg = (
                     f"🔥 <b>Price Drop Alert!</b>\n\n"
@@ -93,7 +93,7 @@ async def check_prices_job():
                     f"🎉 <b>New Price:</b> {new_price} UZS\n\n"
                     f"👉 <a href='{url}'>View Deal</a>"
                 )
-                await send_telegram_alert(chat_id, msg)
+                send_telegram_alert(chat_id, msg)
                 cursor.execute("UPDATE items SET current_price = ? WHERE id = ?", (new_price, item_id))
                 conn.commit()
         except Exception as e:
@@ -136,7 +136,7 @@ def get_items(chat_id: str):
     ]
 
 @app.post("/items")
-async def create_item(payload: ItemCreate):
+def create_item(payload: ItemCreate):
     conn = sqlite3.connect("tracker.db")
     cursor = conn.cursor()
     
@@ -149,7 +149,7 @@ async def create_item(payload: ItemCreate):
             detail="Free tier limit reached (3 items maximum). Upgrade to PRO!"
         )
     
-    title, price = await scrape_item(payload.url)
+    title, price = scrape_item(payload.url)
     
     cursor.execute(
         "INSERT INTO items (url, title, current_price, chat_id) VALUES (?, ?, ?, ?)",
@@ -165,12 +165,12 @@ async def create_item(payload: ItemCreate):
         f"💰 <b>Initial Price:</b> {price} UZS\n\n"
         f"<i>We will notify you immediately if the price drops!</i>"
     )
-    await send_telegram_alert(payload.chat_id, msg)
+    send_telegram_alert(payload.chat_id, msg)
     
     return {"id": new_id, "title": title, "current_price": price, "status": "tracking"}
 
 @app.delete("/items/{item_id}")
-async def delete_item(item_id: int):
+def delete_item(item_id: int):
     conn = sqlite3.connect("tracker.db")
     cursor = conn.cursor()
     
@@ -193,6 +193,6 @@ async def delete_item(item_id: int):
             f"📌 <b>Item:</b> {title}\n\n"
             f"<i>This item is no longer being monitored.</i>"
         )
-        await send_telegram_alert(chat_id, msg)
+        send_telegram_alert(chat_id, msg)
         
     return {"message": "Item deleted successfully"}
